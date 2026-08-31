@@ -3,3 +3,5 @@ telebot
 requests
 user-agents
 telethon
+flask-socketio
+simple-websocket
