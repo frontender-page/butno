@@ -1,0 +1,4 @@
+flask
+telebot
+requests
+user-agents
