@@ -74,6 +74,10 @@ def register_user(user_id, username, first_name):
                    (user_id, username, first_name, datetime.now().isoformat()))
     conn.commit()
 
+@app.route('/health')
+def health():
+    return "OK", 200
+
 def generate_link(user_id, mode):
     link_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
     cursor.execute('INSERT INTO links (link_id, user_id, mode, created_at) VALUES (?, ?, ?, ?)',
